@@ -47,6 +47,119 @@ class ClientSession:
         self.sock = sock
         self.authed = None
   
+def handle_register(conn, sess, req):
+    req_id = req.get("req_id")
+    username = req.get("username")
+    password = req.get("password")
+    db_resp = db_call({"action": "dev_register", "username": username, "password": password})
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_login(conn, sess, req):
+    req_id = req.get("req_id")
+    username = req.get("username")
+    password = req.get("password")
+
+    with LOCK:
+        if username in DEVS:
+            send_json(conn, err("already online", req_id=req_id))
+            return True
+
+    db_resp = db_call({"action": "dev_login", "username": username, "password": password})
+    if db_resp and db_resp.get("status") == "OK":
+        with LOCK:
+            sess.authed = username
+            DEVS[username] = sess
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_list_games(conn, sess, req):
+    req_id = req.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    db_resp = db_call({
+        "action": "dev_list_games",
+        "owner": sess.authed,
+    })
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_create_game(conn, sess, req):
+    req_id = req.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    gamename = req.get("gamename")
+    db_resp = db_call({"action": "dev_create_game","gamename": gamename})
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_update_game(conn, sess, req):
+    req_id = req.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    gamename = req.get("gamename")
+    version  = req.get("version")
+    db_resp = db_call({
+        "action": "dev_update_game",
+        "gamename": gamename,
+        "version": version,
+    })
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_set_game_status(conn, sess, req):
+    req_id = req.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    gamename = req.get("gamename")
+    status   = req.get("status")
+    db_resp = db_call({
+        "action": "dev_set_game_status",
+        "gamename": gamename,
+        "status": status,
+    })
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_upload_game_file(conn, sess, req):
+    req_id = req.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    
+    gamename = req.get("gamename")
+    filename = req.get("filename")
+    
+    save_dir = os.path.join(UPLOAD_DIR, gamename)
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, filename)
+
+    send_json(conn, ok("READY_TO_RECV", req_id=req_id))
+
+    print(f"Receiving file for {gamename}...")
+    success = recv_file(conn, save_path)
+    
+    if success:
+        send_json(conn, ok("upload_success", req_id=req_id))
+        print(f"File saved to {save_path}")
+    else:
+        send_json(conn, err("upload_failed", req_id=req_id))
+    return True
+
+DEV_COMMAND_HANDLERS = {
+    "register": handle_register,
+    "login": handle_login,
+    "list_games": handle_list_games,
+    "create_game": handle_create_game,
+    "update_game": handle_update_game,
+    "set_game_status": handle_set_game_status,
+    "upload_game_file": handle_upload_game_file,
+}
+
 def handle_client(conn, addr):
     print(f"[DEV_Lobby] Client connected from {addr}")
     sess = ClientSession(conn)
@@ -64,100 +177,11 @@ def handle_client(conn, addr):
             if not action:
                 send_json(conn, err("missing action", req_id=req_id))
                 continue
-            # ---------- 使用者註冊/登入/登出（走 DB） ----------
-            if action == "register":
-                username = req.get("username")
-                password = req.get("password")
-                db_resp = db_call({"action": "dev_register", "username": username, "password": password})
-                send_json(conn, with_req_id(db_resp, req_id))
-
-            elif action == "login":
-                username = req.get("username")
-                password = req.get("password")
-
-                with LOCK:
-                    if username in DEVS:
-                        send_json(conn, err("already online", req_id=req_id))
-                        continue
-
-                db_resp = db_call({"action": "dev_login", "username": username, "password": password})
-                if db_resp and db_resp.get("status") == "OK":
-                    with LOCK:
-                        sess.authed = username
-                        DEVS[username] = sess
-                send_json(conn, with_req_id(db_resp, req_id))
-
-                # db_resp = db_call({"action": "show_status", "username": username})
-                # send_json(conn, with_req_id(db_resp, req_id))
-
-            elif action == "list_games":
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id)); continue
-                db_resp = db_call({
-                    "action": "dev_list_games",
-                    "owner": sess.authed,   # 其實 DB 裡 dev_list_games(authed_dev) 已經無視這個參數
-                })
-                send_json(conn, with_req_id(db_resp, req_id))
             
-            elif action == "create_game":
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id)); continue
-                gamename = req.get("gamename")
-                db_resp = db_call({"action": "dev_create_game","gamename": gamename})
-                send_json(conn, with_req_id(db_resp, req_id))
-
-            elif action == "update_game":
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id)); continue
-                gamename = req.get("gamename")
-                version  = req.get("version")
-                db_resp = db_call({
-                    "action": "dev_update_game",
-                    "gamename": gamename,
-                    "version": version,
-                })
-                send_json(conn, with_req_id(db_resp, req_id))
-            
-            elif action == "set_game_status":
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id)); continue
-                gamename = req.get("gamename")
-                status   = req.get("status")   # e.g. "UNLOADED", "PUBLISHED", ...
-                db_resp = db_call({
-                    "action": "dev_set_game_status",
-                    "gamename": gamename,
-                    "status": status,
-                })
-                send_json(conn, with_req_id(db_resp, req_id))
-            
-            elif action == "upload_game_file":
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id)); continue
-                
-                gamename = req.get("gamename")
-                filename = req.get("filename")
-                
-                # 這裡應該要先檢查 DB 是否為該遊戲擁有者 (省略 DB 檢查程式碼以簡化)
-                # is_owner = db_call(...) 
-                
-                # 1. 建立存放路徑: server_games/<gamename>/
-                save_dir = os.path.join(UPLOAD_DIR, gamename)
-                os.makedirs(save_dir, exist_ok=True)
-                save_path = os.path.join(save_dir, filename)
-
-                send_json(conn, ok("READY_TO_RECV", req_id=req_id))
-
-                print(f"Receiving file for {gamename}...")
-                success = recv_file(conn, save_path)
-                
-                if success:
-                    # 4. 更新 DB (選用)：記錄檔案路徑或更新版本時間
-                    # db_call({"action": "update_path", ...}) 
-                    send_json(conn, ok("upload_success", req_id=req_id))
-                    print(f"File saved to {save_path}")
-                else:
-                    send_json(conn, err("upload_failed", req_id=req_id))
-            
+            handler = DEV_COMMAND_HANDLERS.get(action)
+            if handler:
+                if not handler(conn, sess, req):
+                    break
             else:
                 send_json(conn, err("unknown_cmd", req_id=req_id))
     

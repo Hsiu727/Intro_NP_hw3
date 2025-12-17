@@ -207,6 +207,414 @@ def room_start(room: Room, user: str):
 
     print(f"[Lobby] Started game for room {room.id} at {GAME_BIND_HOST}:{port}, advertised as {ADVERTISE_HOST}:{port}")
 
+def handle_register(conn, sess, msg):
+    req_id = msg.get("req_id")
+    username = msg.get("username")
+    password = msg.get("password")
+    db_resp = db_call({"action": "register", "username": username, "password": password})
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_login(conn, sess, msg):
+    req_id = msg.get("req_id")
+    username = msg.get("username")
+    password = msg.get("password")
+
+    with LOCK:
+        if username in USERS:
+            send_json(conn, err("already online", req_id=req_id))
+            return True
+
+    db_resp = db_call({"action": "login", "username": username, "password": password})
+    if db_resp and db_resp.get("status") == "OK":
+        with LOCK:
+            sess.authed = username
+            USERS[username] = sess
+    send_json(conn, with_req_id(db_resp, req_id))
+
+    db_resp = db_call({"action": "show_status", "username": username})
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_who_online(conn, sess, msg):
+    req_id = msg.get("req_id")
+    db_resp = db_call({"action": "who_online"})
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_create_room(conn, sess, msg):
+    req_id = msg.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    public = msg.get("public", True)
+    
+    with LOCK:
+        rid = gen_room_id()
+        db_resp = db_call({
+            "action": "create_room",
+            "room_id": rid,
+            "owner": sess.authed,
+            "public": public
+        })
+        if db_resp.get("status") != "OK":
+            send_json(conn, with_req_id(db_resp, req_id))
+            return True
+
+        room = Room(rid, sess.authed, public)
+        ROOMS[rid] = room
+        sess.room = rid
+    
+    send_json(conn, ok("room_created", req_id=req_id, room={
+        "id": rid,
+        "owner": room.owner,
+        "public": room.public,
+        "players": list(room.players),
+        "open": room.open
+    }))
+    return True
+
+def handle_list_rooms(conn, sess, msg):
+    req_id = msg.get("req_id")
+    db_resp = db_call({"action": "list_rooms", "only_public": True})
+    if db_resp.get("status") == "OK":
+        rooms = db_resp.get("rooms", [])
+        # 合併 lobby 內存中的房間資訊
+        with LOCK:
+            for r in rooms:
+                rid = r["id"]
+                if rid in ROOMS:
+                    r["players"] = list(ROOMS[rid].players)
+                    r["open"] = ROOMS[rid].open
+                else:
+                    # 設為空房
+                    r["players"] = []
+        send_json(conn, ok(rooms=rooms, req_id=req_id))
+    else:
+        send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_list_store_games(conn, sess, msg):
+    req_id = msg.get("req_id")
+    db_resp = db_call({"action": "list_store_games"})
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_download_game(conn, sess, msg):
+    req_id = msg.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    gamename = msg.get("gamename")
+    db_resp = db_call({"action": "download_game", "gamename": gamename, "username": sess.authed})
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_my_downloads(conn, sess, msg):
+    req_id = msg.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    db_resp = db_call({"action": "my_downloads", "username": sess.authed})
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_rate_game(conn, sess, msg):
+    req_id = msg.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    gamename = msg.get("gamename")
+    score = msg.get("score")
+    comment = msg.get("comment", "")
+    db_resp = db_call({
+        "action": "rate_game",
+        "gamename": gamename,
+        "score": score,
+        "comment": comment,
+        "username": sess.authed
+    })
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_list_ratings(conn, sess, msg):
+    req_id = msg.get("req_id")
+    gamename = msg.get("gamename")
+    db_resp = db_call({"action": "list_ratings", "gamename": gamename})
+    send_json(conn, with_req_id(db_resp, req_id))
+    return True
+
+def handle_join_room(conn, sess, msg):
+    req_id = msg.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    rid = msg.get("room")
+    
+    with LOCK:
+        room = ROOMS.get(rid)
+        if not room:
+            send_json(conn, err("no such room", req_id=req_id))
+            return True
+        if not room.public:
+            send_json(conn, err("private room", req_id=req_id))
+            return True
+        if not room.open or room.game is not None:
+            send_json(conn, err("room closed", req_id=req_id))
+            return True
+        if len(room.players) >= 2:
+            send_json(conn, err("room full", req_id=req_id))
+            return True
+        if sess.authed in room.players:
+            send_json(conn, ok("already in room", req_id=req_id))
+            return True
+
+        room.players.append(sess.authed)
+        sess.room = rid
+        with contextlib.suppress(Exception):
+            send_json(conn, _room_status_payload(room))
+            
+        _broadcast_room_status(room, sess.authed)
+                    
+    send_json(conn, ok("joined", req_id=req_id, room=rid))
+    return True
+
+def handle_leave_room(conn, sess, msg):
+    req_id = msg.get("req_id")
+    rid = msg.get("room_id") or sess.room
+    with LOCK:
+        room = ROOMS.get(rid)
+        if not room or sess.authed not in room.players:
+            send_json(conn, err("not in room", req_id=req_id))
+            return True
+
+        room.players.remove(sess.authed)
+        if room.owner == sess.authed:
+            room.owner = room.players[0] if room.players else None
+        if not room.players:
+            ROOMS.pop(rid, None)
+            with contextlib.suppress(Exception):
+                db_call({"action":"delete_room", "room_id": rid})
+            sess.room = None
+            send_json(conn, ok("left", req_id=req_id))
+            return True
+
+        #    (a) 若沒有進行中的 game → 確保 open=True（允許他人加入）
+        #    (b) 若正在對局但少於 2 人 → 判定對局結束、重置房間
+        needs_reset = False
+        if room.game is None:
+            needs_reset = True
+        elif len(room.players) < 2:
+            needs_reset = True
+            # 可選：通知仍在房內的那位玩家勝出（如果 game server 沒來得及 on_finish）
+            survivor = room.players[0]
+            peer = USERS.get(survivor)
+            if peer:
+                info = {"room": rid, "winner": survivor, "reason": "opponent_left_room"}
+                with contextlib.suppress(Exception):
+                    send_json(peer.sock, {"event":"game_finished", "finish": info})
+
+        if needs_reset:
+            _reset_room(room, announce=True)
+
+    # 如果有進行中的遊戲，通知該 game server 強制結束
+    if room.game:
+        host = room.game.get("bind_host", room.game["host"])
+        port = room.game["port"]
+
+        try:
+            # 用 socket 發一個 JSON 訊息告訴 game server 要 shutdown
+            with socket.create_connection((host, port), timeout=1.0) as s:
+                send_json(s, {"type": "force_stop"})
+        except Exception as e:
+            print(f"[Lobby] Failed to notify game server at {host}:{port}: {e}")
+
+    send_json(conn, ok("left", req_id=req_id))
+    return True
+
+def handle_start_game(conn, sess, msg):
+    req_id = msg.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    rid = msg.get("room_id") or msg.get("room")
+    if not rid:
+        send_json(conn, err("missing room_id", req_id=req_id))
+        return True
+
+    with LOCK:
+        room = ROOMS.get(rid)
+        if not room:
+            send_json(conn, err("no such room", req_id=req_id))
+            return True
+        if room.owner != sess.authed:
+            send_json(conn, err("only owner can start", req_id=req_id))
+            return True
+        if len(room.players) < 2:
+            send_json(conn, err("need two players", req_id=req_id))
+            return True
+        if room.game is not None:
+            send_json(conn, err("game already started", req_id=req_id))
+            return True
+
+    room_start(room, sess.authed)
+    game_info = {"room": rid, **room.game}
+    send_json(conn, ok("started", req_id=req_id, game=game_info))
+    return True
+
+def handle_invite(conn, sess, msg):
+    req_id = msg.get("req_id")
+    if not sess.authed or not sess.room:
+        send_json(conn, err("not_in_room", req_id=req_id))
+        return True
+    target = msg.get("target")
+    with LOCK:
+        room = ROOMS.get(sess.room)
+        if not room:
+            send_json(conn, err("no such room", req_id=req_id))
+            return True
+        if len(room.players) >= 2:
+            send_json(conn, err("room full", req_id=req_id))
+            return True
+        tgt = USERS.get(target)
+        if not tgt:
+            send_json(conn, err("target offline", req_id=req_id))
+            return True
+        tgt.invitations.append(
+            {"type": "invite", "from": sess.authed, "room_id": room.id}
+        )
+    send_json(conn, ok("invite sent", req_id=req_id, target=target, room_id=room.id))
+    return True
+
+def handle_pull_notices(conn, sess, msg):
+    req_id = msg.get("req_id")
+    with LOCK:
+        notices = list(sess.invitations)
+        sess.invitations.clear()
+    send_json(conn, ok(notices=notices, req_id=req_id))
+    return True
+
+def handle_accept_invite(conn, sess, msg):
+    req_id = msg.get("req_id")
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    rid = msg.get("room_id")
+    
+    with LOCK:
+        room = ROOMS.get(rid)
+        if not room:
+            send_json(conn, err("no such room", req_id=req_id))
+            return True
+        if len(room.players) >= 2:
+            send_json(conn, err("room full", req_id=req_id))
+            return True
+        if sess.authed not in room.players:
+            room.players.append(sess.authed)
+            with contextlib.suppress(Exception):
+                send_json(conn, _room_status_payload(room))
+            _broadcast_room_status(room, sess.authed)
+        sess.room = rid
+
+    send_json(conn, ok("joined", req_id=req_id, room_id=rid))
+    return True
+
+def handle_quit(conn, sess, msg):
+    req_id = msg.get("req_id")
+    username = sess.authed
+    rid = sess.room
+    room = None
+    # 先處理房內狀態（等同 leave_room）
+    with LOCK:
+        if rid:
+            room = ROOMS.get(rid)
+            if room and username in room.players:
+                room.players.remove(username)
+                # 移交或刪房
+                if room.owner == username:
+                    room.owner = room.players[0] if room.players else None
+                if not room.players:
+                    ROOMS.pop(rid, None)
+                    with contextlib.suppress(Exception):
+                        db_call({"action": "delete_room", "room_id": rid})
+                else:
+                    # 沒空房 → 重置房況並廣播
+                    _reset_room(room, announce=True)
+
+    # 若剛剛那間房正在開局，通知 game-server 強制結束（與 leave_room 同步）
+    if room and room.game:
+        host = room.game.get("bind_host", room.game["host"])
+        port = room.game["port"]
+        with contextlib.suppress(Exception):
+            with socket.create_connection((host, port), timeout=1.0) as s:
+                send_json(s, {"type": "force_stop"})
+
+    # DB 登出、清線上清單
+    db_call({"action": "quit", "username": username})
+    with LOCK:
+        USERS.pop(username, None)
+        sess.authed = None
+        sess.room = None
+    send_json(conn, ok("bye", req_id=req_id))
+    return False
+
+def handle_download_game_file(conn, sess, msg):
+    req_id = msg.get("req_id")
+    # 為了避免混淆，將原本單純改 DB 的 download_game 保留，
+    # 這個 action 專門負責傳檔案
+    if not sess.authed:
+        send_json(conn, err("not logged in", req_id=req_id))
+        return True
+    
+    gamename = msg.get("gamename")
+    
+    # 1. 尋找檔案
+    # 這裡簡化邏輯：假設每個遊戲資料夾下只有一個檔案，或者你需要 DB 紀錄檔名
+    game_dir = os.path.join(UPLOAD_DIR, gamename)
+    target_file = None
+    
+    if os.path.exists(game_dir):
+        files = os.listdir(game_dir)
+        if files:
+            # 簡單起見，拿第一個檔案
+            target_file = os.path.join(game_dir, files[0])
+    
+    if not target_file:
+        send_json(conn, err("game_file_not_found", req_id=req_id))
+        return True
+
+    # 2. 告訴 Client 準備接收 (包含檔名)
+    filename = os.path.basename(target_file)
+    send_json(conn, ok("READY_TO_SEND", req_id=req_id, filename=filename))
+
+    # 3. 發送檔案
+    send_file(conn, target_file)
+    
+    # 4. (選用) 在此處呼叫 DB 記錄下載次數
+    db_call({"action": "download_game", "gamename": gamename, "username": sess.authed})
+    return True
+
+COMMAND_HANDLERS = {
+    "register": handle_register,
+    "login": handle_login,
+    "who_online": handle_who_online,
+    "create_room": handle_create_room,
+    "list_rooms": handle_list_rooms,
+    "list_store_games": handle_list_store_games,
+    "download_game": handle_download_game,
+    "my_downloads": handle_my_downloads,
+    "rate_game": handle_rate_game,
+    "list_ratings": handle_list_ratings,
+    "join_room": handle_join_room,
+    "leave_room": handle_leave_room,
+    "start_game": handle_start_game,
+    "invite": handle_invite,
+    "pull_notices": handle_pull_notices,
+    "accept_invite": handle_accept_invite,
+    "QUIT": handle_quit,
+    "download_game_file": handle_download_game_file,
+}
+
 def handle_client(conn, addr):
     print(f"[Lobby] Client connected from {addr}")
     sess = ClientSession(conn)
@@ -224,351 +632,11 @@ def handle_client(conn, addr):
             if not action:
                 send_json(conn, err("missing action", req_id=req_id))
                 continue
-            # ---------- 使用者註冊/登入/登出（走 DB） ----------
-            if action == "register":
-                username = req.get("username")
-                password = req.get("password")
-                db_resp = db_call({"action": "register", "username": username, "password": password})
-                send_json(conn, with_req_id(db_resp, req_id))
-
-            elif action == "login":
-                username = req.get("username")
-                password = req.get("password")
-
-                with LOCK:
-                    if username in USERS:
-                        send_json(conn, err("already online", req_id=req_id))
-                        continue
-
-                db_resp = db_call({"action": "login", "username": username, "password": password})
-                if db_resp and db_resp.get("status") == "OK":
-                    with LOCK:
-                        sess.authed = username
-                        USERS[username] = sess
-                send_json(conn, with_req_id(db_resp, req_id))
-
-                db_resp = db_call({"action": "show_status", "username": username})
-                send_json(conn, with_req_id(db_resp, req_id))
-
-            elif action == "who_online":
-                db_resp = db_call({"action": "who_online"})
-                send_json(conn, with_req_id(db_resp, req_id))
-
-            # ---------- 房間 ----------
-            elif action == "create_room":
-                if not sess.authed: send_json(conn, err("not logged in", req_id=req_id)); continue
-                public = req.get("public", True)
-                
-                with LOCK:
-                    rid = gen_room_id()
-                    db_resp = db_call({
-                        "action": "create_room",
-                        "room_id": rid,
-                        "owner": sess.authed,
-                        "public": public
-                    })
-                    if db_resp.get("status") != "OK":
-                        send_json(conn, with_req_id(db_resp, req_id))
-                        continue
-
-                    room = Room(rid, sess.authed, public)
-                    ROOMS[rid] = room
-                    sess.room = rid
-                
-                send_json(conn, ok("room_created", req_id=req_id, room={
-                    "id": rid,
-                    "owner": room.owner,
-                    "public": room.public,
-                    "players": list(room.players),
-                    "open": room.open
-                }))
-
-            elif action == "list_rooms":
-                db_resp = db_call({"action": "list_rooms", "only_public": True})
-                if db_resp.get("status") == "OK":
-                    rooms = db_resp.get("rooms", [])
-                # 合併 lobby 內存中的房間資訊
-                    with LOCK:
-                        for r in rooms:
-                            rid = r["id"]
-                            if rid in ROOMS:
-                                r["players"] = list(ROOMS[rid].players)
-                                r["open"] = ROOMS[rid].open
-                            else:
-                                # 設為空房
-                                r["players"] = []
-                    send_json(conn, ok(rooms=rooms, req_id=req_id))
-                else:
-                    send_json(conn, with_req_id(db_resp, req_id))
-
-            # ---------- Store / downloads / ratings ----------
-            elif action == "list_store_games":
-                db_resp = db_call({"action": "list_store_games"})
-                send_json(conn, with_req_id(db_resp, req_id))
-            # todo
-            elif action == "download_game":
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id)); continue
-                gamename = req.get("gamename")
-                db_resp = db_call({"action": "download_game", "gamename": gamename, "username": sess.authed})
-                send_json(conn, with_req_id(db_resp, req_id))
-
-            elif action == "my_downloads":
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id)); continue
-                db_resp = db_call({"action": "my_downloads", "username": sess.authed})
-                send_json(conn, with_req_id(db_resp, req_id))
-            # not necessary
-            elif action == "rate_game":
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id)); continue
-                gamename = req.get("gamename")
-                score = req.get("score")
-                comment = req.get("comment", "")
-                db_resp = db_call({
-                    "action": "rate_game",
-                    "gamename": gamename,
-                    "score": score,
-                    "comment": comment,
-                    "username": sess.authed
-                })
-                send_json(conn, with_req_id(db_resp, req_id))
-
-            elif action == "list_ratings":
-                gamename = req.get("gamename")
-                db_resp = db_call({"action": "list_ratings", "gamename": gamename})
-                send_json(conn, with_req_id(db_resp, req_id))
             
-            elif action == "join_room":
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id))
-                    continue
-                rid = req.get("room")
-                
-                with LOCK:
-                    room = ROOMS.get(rid)
-                    if not room:
-                        send_json(conn, err("no such room", req_id=req_id))
-                        continue
-                    if not room.public:
-                        send_json(conn, err("private room", req_id=req_id))
-                        continue
-                    if not room.open or room.game is not None:
-                        send_json(conn, err("room closed", req_id=req_id))
-                        continue
-                    if len(room.players) >= 2:
-                        send_json(conn, err("room full", req_id=req_id))
-                        continue
-                    if sess.authed in room.players:
-                        send_json(conn, ok("already in room", req_id=req_id))
-                        continue
-
-                    room.players.append(sess.authed)
-                    sess.room = rid
-                    with contextlib.suppress(Exception):
-                        send_json(conn, _room_status_payload(room))
-                        
-                    _broadcast_room_status(room, sess.authed)
-                                
-                send_json(conn, ok("joined", req_id=req_id, room=rid))
-
-            elif action == "leave_room":
-                rid = req.get("room_id") or sess.room
-                with LOCK:
-                    room = ROOMS.get(rid)
-                    if not room or sess.authed not in room.players:
-                        send_json(conn, err("not in room", req_id=req_id))
-                        continue
-
-                    room.players.remove(sess.authed)
-                    if room.owner == sess.authed:
-                        room.owner = room.players[0] if room.players else None
-                    if not room.players:
-                        ROOMS.pop(rid, None)
-                        with contextlib.suppress(Exception):
-                            db_call({"action":"delete_room", "room_id": rid})
-                        sess.room = None
-                        send_json(conn, ok("left", req_id=req_id))
-                        continue
-
-                    #    (a) 若沒有進行中的 game → 確保 open=True（允許他人加入）
-                    #    (b) 若正在對局但少於 2 人 → 判定對局結束、重置房間
-                    needs_reset = False
-                    if room.game is None:
-                        needs_reset = True
-                    elif len(room.players) < 2:
-                        needs_reset = True
-                        # 可選：通知仍在房內的那位玩家勝出（如果 game server 沒來得及 on_finish）
-                        survivor = room.players[0]
-                        peer = USERS.get(survivor)
-                        if peer:
-                            info = {"room": rid, "winner": survivor, "reason": "opponent_left_room"}
-                            with contextlib.suppress(Exception):
-                                send_json(peer.sock, {"event":"game_finished", "finish": info})
-
-                    if needs_reset:
-                        _reset_room(room, announce=True)
-
-                # 如果有進行中的遊戲，通知該 game server 強制結束
-                if room.game:
-                    host = room.game.get("bind_host", room.game["host"])
-                    port = room.game["port"]
-
-                    try:
-                        # 用 socket 發一個 JSON 訊息告訴 game server 要 shutdown
-                        with socket.create_connection((host, port), timeout=1.0) as s:
-                            send_json(s, {"type": "force_stop"})
-                    except Exception as e:
-                        print(f"[Lobby] Failed to notify game server at {host}:{port}: {e}")
-
-                send_json(conn, ok("left", req_id=req_id))
-
-            elif action == "start_game":
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id)); continue
-                rid = req.get("room_id") or req.get("room")
-                if not rid:
-                    send_json(conn, err("missing room_id", req_id=req_id)); continue
-
-                with LOCK:
-                    room = ROOMS.get(rid)
-                    if not room:
-                        send_json(conn, err("no such room", req_id=req_id)); continue
-                    if room.owner != sess.authed:
-                        send_json(conn, err("only owner can start", req_id=req_id)); continue
-                    if len(room.players) < 2:
-                        send_json(conn, err("need two players", req_id=req_id)); continue
-                    if room.game is not None:
-                        send_json(conn, err("game already started", req_id=req_id)); continue
-
-                room_start(room, sess.authed)
-                game_info = {"room": rid, **room.game}
-                send_json(conn, ok("started", req_id=req_id, game=game_info))
-
-            # ---------- 邀請 / 通知 ----------
-            elif action == "invite":
-                if not sess.authed or not sess.room:
-                    send_json(conn, err("not_in_room", req_id=req_id)); continue
-                target = req.get("target")
-                with LOCK:
-                    room = ROOMS.get(sess.room)
-                    if not room:
-                        send_json(conn, err("no such room", req_id=req_id))
-                        continue
-                    if len(room.players) >= 2:
-                        send_json(conn, err("room full", req_id=req_id))
-                        continue
-                    tgt = USERS.get(target)
-                    if not tgt:
-                        send_json(conn, err("target offline", req_id=req_id))
-                        continue
-                    tgt.invitations.append(
-                        {"type": "invite", "from": sess.authed, "room_id": room.id}
-                    )
-                send_json(conn, ok("invite sent", req_id=req_id, target=target, room_id=room.id))
-            
-            elif action == "pull_notices":
-                with LOCK:
-                    notices = list(sess.invitations)
-                    sess.invitations.clear()
-                send_json(conn, ok(notices=notices, req_id=req_id))
-
-            elif action == "accept_invite":
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id))
-                    continue
-                rid = req.get("room_id")
-                
-                with LOCK:
-                    room = ROOMS.get(rid)
-                    if not room:
-                        send_json(conn, err("no such room", req_id=req_id))
-                        continue
-                    if len(room.players) >= 2:
-                        send_json(conn, err("room full", req_id=req_id))
-                        continue
-                    if sess.authed not in room.players:
-                        room.players.append(sess.authed)
-                        with contextlib.suppress(Exception):
-                            send_json(conn, _room_status_payload(room))
-                        _broadcast_room_status(room, sess.authed)
-                    sess.room = rid
-
-                send_json(conn, ok("joined", req_id=req_id, room_id=rid))
-            
-            # lobby.py → handle_client(...)
-
-            elif action == "QUIT":
-                username = sess.authed
-                rid = sess.room
-                room = None
-                # 先處理房內狀態（等同 leave_room）
-                with LOCK:
-                    if rid:
-                        room = ROOMS.get(rid)
-                        if room and username in room.players:
-                            room.players.remove(username)
-                            # 移交或刪房
-                            if room.owner == username:
-                                room.owner = room.players[0] if room.players else None
-                            if not room.players:
-                                ROOMS.pop(rid, None)
-                                with contextlib.suppress(Exception):
-                                    db_call({"action": "delete_room", "room_id": rid})
-                            else:
-                                # 沒空房 → 重置房況並廣播
-                                _reset_room(room, announce=True)
-
-                # 若剛剛那間房正在開局，通知 game-server 強制結束（與 leave_room 同步）
-                if room and room.game:
-                    host = room.game.get("bind_host", room.game["host"])
-                    port = room.game["port"]
-                    with contextlib.suppress(Exception):
-                        with socket.create_connection((host, port), timeout=1.0) as s:
-                            send_json(s, {"type": "force_stop"})
-
-                # DB 登出、清線上清單
-                db_call({"action": "quit", "username": username})
-                with LOCK:
-                    USERS.pop(username, None)
-                    sess.authed = None
-                    sess.room = None
-                send_json(conn, ok("bye", req_id=req_id))
-                break
-
-            elif action == "download_game_file":
-                # 為了避免混淆，將原本單純改 DB 的 download_game 保留，
-                # 這個 action 專門負責傳檔案
-                if not sess.authed:
-                    send_json(conn, err("not logged in", req_id=req_id)); continue
-                
-                gamename = req.get("gamename")
-                
-                # 1. 尋找檔案
-                # 這裡簡化邏輯：假設每個遊戲資料夾下只有一個檔案，或者你需要 DB 紀錄檔名
-                game_dir = os.path.join(UPLOAD_DIR, gamename)
-                target_file = None
-                
-                if os.path.exists(game_dir):
-                    files = os.listdir(game_dir)
-                    if files:
-                        # 簡單起見，拿第一個檔案
-                        target_file = os.path.join(game_dir, files[0])
-                
-                if not target_file:
-                    send_json(conn, err("game_file_not_found", req_id=req_id))
-                    continue
-
-                # 2. 告訴 Client 準備接收 (包含檔名)
-                filename = os.path.basename(target_file)
-                send_json(conn, ok("READY_TO_SEND", req_id=req_id, filename=filename))
-
-                # 3. 發送檔案
-                send_file(conn, target_file)
-                
-                # 4. (選用) 在此處呼叫 DB 記錄下載次數
-                db_call({"action": "download_game", "gamename": gamename, "username": sess.authed})
-            
+            handler = COMMAND_HANDLERS.get(action)
+            if handler:
+                if not handler(conn, sess, req):
+                    break
             else:
                 send_json(conn, err("unknown_cmd", req_id=req_id))
     
