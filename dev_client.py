@@ -8,7 +8,7 @@ from typing import Optional
 from utils import send_json, recv_json, gen_req_id, send_file
 
 HOST = os.getenv("DEV_LOBBY_HOST", "140.113.17.11")
-PORT = int(os.getenv("DEV_LOBBY_PORT", "18950"))
+PORT = int(os.getenv("DEV_LOBBY_PORT", "18955"))
 
 class DevClient:
     def __init__(self, host: str, port: int):

@@ -13,7 +13,7 @@ from utils import send_json, recv_json, gen_req_id, recv_file
 
 # 連線設定 (可透過環境變數覆寫)
 HOST = os.getenv("LOBBY_HOST", "140.113.17.11")
-PORT = int(os.getenv("LOBBY_PORT", "18900"))
+PORT = int(os.getenv("LOBBY_PORT", "18905"))
 
 class LobbyClient:
     def __init__(self):

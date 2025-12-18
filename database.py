@@ -7,7 +7,7 @@ from typing import Optional
 from utils import ok, err, send_json, recv_json
 
 HOST = "140.113.17.11"
-PORT = 19800
+PORT = 19805
 DB_PATH = "np_hw.db"
 
 # 修正 1 & 2: 更新 Schema，加入 file_path, properties, user_plugins, relations

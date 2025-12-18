@@ -4,9 +4,9 @@ from typing import Dict
 from utils import ok, err, send_json, recv_json, gen_room_id, with_req_id, recv_file
 
 # === setup ===
-HOST, PORT = "140.113.17.11", 18950
+HOST, PORT = "140.113.17.11", 18955
 # HOST, PORT = "localhost", 18950
-DB_HOST, DB_PORT = "140.113.17.11", 19800
+DB_HOST, DB_PORT = "140.113.17.11", 19805
 MAX_LEN = 65536
 
 # ==== Lobby 狀態 ====
