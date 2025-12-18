@@ -6,12 +6,13 @@ import time
 import queue
 import subprocess
 import shlex
+import select
 
 # 引入 utils 中的函式 (請確保 utils.py 已包含 recv_file)
 from utils import send_json, recv_json, gen_req_id, recv_file
 
 # 連線設定 (可透過環境變數覆寫)
-HOST = os.getenv("LOBBY_HOST", "localhost")
+HOST = os.getenv("LOBBY_HOST", "140.113.17.11")
 PORT = int(os.getenv("LOBBY_PORT", "18900"))
 
 class LobbyClient:
@@ -20,6 +21,7 @@ class LobbyClient:
         self.username = None
         self.running = True
         self.current_room_id = None
+        self.pending_game_info = None
         
         # 用於存放等待中的 Request 回應 (req_id -> payload)
         self.response_queues = {}
@@ -27,6 +29,7 @@ class LobbyClient:
         
         # 用於存放非同步通知 (如邀請、遊戲開始)，供 UI 顯示
         self.notification_queue = queue.Queue()
+        self.game_process = None
 
     def connect(self):
         try:
@@ -126,7 +129,8 @@ class LobbyClient:
             # [P3] 自動啟動遊戲
             game_info = msg.get("game", {})
             self.notification_queue.put(f"!!! 遊戲開始 !!! Room: {game_info.get('room')}")
-            self._launch_game_client(game_info)
+            # 由主執行緒在房間等待流程中啟動，避免與輸入搶 stdin
+            self.pending_game_info = game_info
             
         elif event == "room_status":
             # 更新房間顯示 (如果正在房間畫面的話)
@@ -141,39 +145,51 @@ class LobbyClient:
         else:
             self.notification_queue.put(f"[Notification] {msg}")
 
-    def _launch_game_client(self, game_info):
-        """
-        啟動 Client 端遊戲程式 
-        假設遊戲路徑為: downloads/{username}/{room_id_linked_game?}/game.py
-        由於 Lobby 協議目前只回傳 port，沒回傳 gamename，
-        我們需要知道現在房間玩的是哪個遊戲。
-        簡化起見：假設玩家已經知道自己在玩什麼 (在 Room 狀態中有紀錄)。
-        """
-        # 注意：這邊簡化處理，實際作業中 Server 的 room_status 應該要包含 gamename
-        # 假設我們從目前的 self.current_game_context 取得
-        gamename = getattr(self, "current_gamename", None) 
-        
+    def _launch_game_client(self, game_info, block_on_fallback: bool = False):
+        # 1. 取得遊戲名稱 (邏輯不變)
+        gamename = game_info.get("gamename") or getattr(self, "current_gamename", None)
         if not gamename:
             print("[Error] 無法啟動遊戲：未知遊戲名稱")
             return
 
-        # 組合路徑 downloads/Player/Game/main.py (假設進入點都是 main.py 或 game.py)
-        # 需配合 PDF [cite: 17] 的統一規格
-        game_path = os.path.join("downloads", self.username, gamename, "main.py") # 或 game.py
-        
-        if not os.path.exists(game_path):
-            print(f"[Error] 找不到遊戲檔案：{game_path}，請先下載！")
-            return
-
+        game_path = os.path.join("downloads", self.username, gamename, "main.py")
         host = game_info.get("host", "localhost")
         port = str(game_info.get("port"))
         
-        print(f"[System] Launching game: {gamename} connecting to {host}:{port}")
+        print(f"[System] 嘗試在新視窗啟動遊戲: {gamename} ...")
         
         try:
-            # 啟動子程序 [cite: 165]
-            # 格式: python <game_script> <host> <port>
-            subprocess.Popen([sys.executable, game_path, host, port])
+            # === Windows 系統 ===
+            if sys.platform == "win32":
+                self.game_process = subprocess.Popen(
+                    [sys.executable, game_path, host, port],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE
+                )
+            
+            # === Linux 系統 (有桌面環境，如 Ubuntu/GNOME) ===
+            elif sys.platform.startswith("linux"):
+                # 嘗試使用常見的終端機模擬器
+                try:
+                    self.game_process = subprocess.Popen([
+                        "gnome-terminal", "--", 
+                        sys.executable, game_path, host, port
+                    ])
+                except FileNotFoundError:
+                    # 如果沒有 gnome-terminal，嘗試 xterm
+                    try:
+                        self.game_process = subprocess.Popen([
+                            "xterm", "-e", 
+                            sys.executable, game_path, host, port
+                        ])
+                    except FileNotFoundError:
+                        print("[System] 找不到可用的終端機視窗，將在當前視窗執行...")
+                        # Fallback: 如果真的開不了新視窗，只好回到原本的同一視窗模式
+                        if block_on_fallback:
+                            subprocess.run([sys.executable, game_path, host, port])
+                            return
+                        self.game_process = subprocess.Popen([sys.executable, game_path, host, port])
+                        print("\n>>> 請按 [Enter] 鍵將控制權交給遊戲 (重要！) <<<\n")
+
         except Exception as e:
             print(f"[Error] Failed to launch game: {e}")
 
@@ -479,17 +495,51 @@ class LobbyClient:
             pass
 
     def menu_room_wait(self):
-        """ 房間內的等待畫面 """
         print(f"\n=== 房間: {self.current_room_id} ===")
         print("等待其他玩家中...")
         print("如果是房主，當人數足夠時可輸入 'start' 開始遊戲")
         print("輸入 'leave' 離開房間")
         
         while self.current_room_id:
-            # 這裡需要一個非阻塞的 input，或者簡單的阻塞 input
-            # 由於 listener 會處理 async events (game_start)，這裡只要負責 user command
-            cmd = input("(Room) > ").strip().lower()
-            
+            # 若收到 game_started，這裡負責啟動遊戲，避免 listener 搶 stdin
+            if self.pending_game_info:
+                game_info = self.pending_game_info
+                self.pending_game_info = None
+                self._launch_game_client(game_info, block_on_fallback=True)
+                self.clear_screen()
+                print(f"=== 房間: {self.current_room_id} (遊戲結束) ===")
+                print("輸入 'start' 再次開始，或 'leave' 離開")
+                continue
+
+            # [Check 1] 迴圈開始前，先檢查是否有遊戲正在跑 (針對 P1 剛按完 start 的情況)
+            if self.game_process:
+                self.game_process.wait() # 這裡會暫停 Lobby，直到遊戲結束
+                self.game_process = None
+                # 遊戲結束後，重繪介面
+                self.clear_screen()
+                print(f"=== 房間: {self.current_room_id} (遊戲結束) ===")
+                print("輸入 'start' 再次開始，或 'leave' 離開")
+                continue # 跳過這一次 input，重新開始迴圈
+
+            # 正常等待輸入 (非阻塞輪詢，避免卡住錯過 game_started)
+            if sys.platform.startswith("linux"):
+                ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                if not ready:
+                    continue
+                cmd = sys.stdin.readline().strip().lower()
+            else:
+                cmd = input("(Room) > ").strip().lower()
+
+            # [Check 2] 使用者按下 Enter 後 (針對 P2 被動接收通知的情況)
+            # 如果此時遊戲剛好啟動了，game_process 會有值
+            if self.game_process:
+                self.game_process.wait() # 讓出控制權
+                self.game_process = None
+                self.clear_screen()
+                print(f"=== 房間: {self.current_room_id} (遊戲結束) ===")
+                continue
+
+            # ... (原本的指令處理) ...
             if cmd == "leave":
                 self.call("leave_room")
                 self.current_room_id = None
@@ -497,24 +547,12 @@ class LobbyClient:
                 break
             
             elif cmd == "start":
-                # [P3] 房主開始遊戲
-                if not self.current_gamename:
-                    # 如果是加入者，可能不知道現在要玩啥，需要 Room Status 同步
-                    # 這裡簡化：假設大家都有協調好
-                    print("警告：未指定遊戲 (只有自己開房時才設定了 gamename)")
-                
-                # start_game 呼叫
+                # ... (原本的 start 邏輯) ...
                 res = self.call("start_game", room_id=self.current_room_id)
                 if res.get("status") != "OK":
                     print("開始失敗:", res.get("msg"))
-            
-            elif cmd == "status":
-                # 顯示房間詳細 (透過 listener 接收 room_status 更新更好)
-                pass
-                
-            # 注意：當 listener 收到 game_started，會自動 subprocess 啟動遊戲
-            # 使用者介面可以停在這裡，或者顯示 "遊戲進行中..."
-            # 遊戲視窗通常是獨立的 (GUI) 或新的 Terminal 視窗
+                # 如果成功，Server 會送 game_started 事件 -> _launch_game_client 設定 self.game_process
+                # 迴圈下一輪 [Check 1] 就會抓到並進入等待狀態
 
 if __name__ == "__main__":
     client = LobbyClient()

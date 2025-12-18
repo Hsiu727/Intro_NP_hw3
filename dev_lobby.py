@@ -4,8 +4,8 @@ from typing import Dict
 from utils import ok, err, send_json, recv_json, gen_room_id, with_req_id, recv_file
 
 # === setup ===
-# HOST, PORT = "140.113.17.11", 18950
-HOST, PORT = "localhost", 18950
+HOST, PORT = "140.113.17.11", 18950
+# HOST, PORT = "localhost", 18950
 DB_HOST, DB_PORT = "140.113.17.11", 19800
 MAX_LEN = 65536
 
@@ -135,16 +135,27 @@ def handle_upload_game_file(conn, sess, req):
         send_json(conn, err("not logged in", req_id=req_id))
         return True
     
-    gamename = req.get("gamename")
     filename = req.get("filename")
     
-    save_dir = os.path.join(UPLOAD_DIR, gamename)
+    # 1. 安全過濾 gamename
+    raw_gamename = req.get("gamename", "default_game")
+    # 只保留安全字元，防止路徑攻擊
+    safe_gamename = "".join([c for c in raw_gamename if c.isalnum() or c in ('-', '_')]).strip()
+    
+    if not safe_gamename:
+        safe_gamename = "unknown_game"
+    
+    if not filename.endswith(".py"):
+        send_json(conn, err("Only .py files are allowed", req_id=req_id))
+        return True
+    
+    save_dir = os.path.join(UPLOAD_DIR, safe_gamename)
     os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, filename)
+    save_path = os.path.join(save_dir, "main.py")
 
     send_json(conn, ok("READY_TO_RECV", req_id=req_id))
 
-    print(f"Receiving file for {gamename}...")
+    print(f"Receiving file for {safe_gamename}...")
     success = recv_file(conn, save_path)
     
     if success:
@@ -153,7 +164,7 @@ def handle_upload_game_file(conn, sess, req):
             db_call({
                 "action": "dev_update_game_path",
                 "owner": sess.authed,
-                "gamename": gamename,
+                "gamename": safe_gamename,
                 "file_path": save_path,
             })
         send_json(conn, ok("upload_success", req_id=req_id))

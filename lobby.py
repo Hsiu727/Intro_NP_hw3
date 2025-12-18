@@ -4,8 +4,8 @@ from typing import Dict
 from utils import ok, err, send_json, recv_json, gen_room_id, with_req_id, send_file
 
 # === setup ===
-# HOST, PORT = "140.113.17.11", 18900
-HOST, PORT = "localhost", 18900
+HOST, PORT = "140.113.17.11", 18900
+# HOST, PORT = "localhost", 18900
 DB_HOST, DB_PORT = "140.113.17.11", 19800
 MAX_LEN = 65536
 
@@ -32,68 +32,6 @@ def allocate_port_in_range() -> int:
             except OSError:
                 continue
     raise RuntimeError(f"No free port in range {PORT_MIN}-{PORT_MAX}")
-
-
-# ====== Minimal stub game server so lobby start/stop flows won't crash ======
-class StubGameServer:
-    def __init__(self, room_id: str, host: str, port: int, on_finish):
-        self.room_id = room_id
-        self.host = host
-        self.port = port
-        self.on_finish = on_finish
-        self._running = threading.Event()
-        self._running.set()
-        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._srv.bind((host, port))
-        self._srv.listen(8)
-        self._serve_thread = threading.Thread(target=self._serve, daemon=True)
-        # 自動結束計時器，避免長時間佔用 port
-        self._auto_timer = threading.Timer(10.0, self.stop, kwargs={"reason": "auto_finish"})
-
-    def start(self):
-        self._serve_thread.start()
-        self._auto_timer.start()
-
-    def _serve(self):
-        while self._running.is_set():
-            try:
-                self._srv.settimeout(1.0)
-                conn, addr = self._srv.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break  # socket closed
-            threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
-
-        with contextlib.suppress(Exception):
-            self._srv.close()
-
-    def _handle_client(self, conn, addr):
-        try:
-            msg = recv_json(conn)
-            if msg and msg.get("type") == "force_stop":
-                send_json(conn, {"status": "OK", "msg": "stopping"})
-                self.stop(reason="forced_stop")
-        except Exception:
-            pass
-        finally:
-            with contextlib.suppress(Exception):
-                conn.close()
-
-    def stop(self, reason: str = "stopped"):
-        if not self._running.is_set():
-            return
-        self._running.clear()
-        with contextlib.suppress(Exception):
-            self._srv.close()
-        with contextlib.suppress(Exception):
-            self._auto_timer.cancel()
-        if self.on_finish:
-            try:
-                self.on_finish(self.room_id, {"reason": reason})
-            except Exception as e:
-                print(f"[Lobby] on_finish callback error: {e}")
 
 class BroadcastGameServer:
     """
@@ -287,7 +225,7 @@ def room_start(room: Room, user: str):
         pass
     # 推播開始
     # lobby.py → room_start(...)
-    info = {"room": room.id, **room.game}
+    info = {"room": room.id, "gamename": room.gamename, **room.game}
     for p in room.players:
         peer = USERS.get(p)
         # if p == user:

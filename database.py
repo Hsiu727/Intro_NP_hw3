@@ -390,16 +390,32 @@ class DB:
     # ================= Store / Downloads =================
     def list_store_games(self):
         with self.lock:
-            rows = self.conn.execute("SELECT gamename, owner, status, latest, file_path FROM games").fetchall()
-        return [{"gamename":r["gamename"], "owner":r["owner"], "status":r["status"], "latest":r["latest"], "file_path":r["file_path"]} for r in rows]
+            rows = self.conn.execute(
+                "SELECT gamename, owner, status, latest, file_path FROM games WHERE status='PUBLISHED' ORDER BY gamename ASC"
+            ).fetchall()
+        return [
+            {
+                "gamename": r["gamename"],
+                "owner": r["owner"],
+                "status": r["status"],
+                "latest": r["latest"],
+                "file_path": r["file_path"],
+            }
+            for r in rows
+        ]
         
     def download_game(self, username, gamename):
         # 只是紀錄下載行為，不負責傳檔
         # 要先查版本
         with self.lock:
-            cur = self.conn.execute("SELECT latest FROM games WHERE gamename=?", (gamename,))
+            cur = self.conn.execute(
+                "SELECT latest, status FROM games WHERE gamename=?", (gamename,)
+            )
             row = cur.fetchone()
-            if not row: return False, "no such game"
+            if not row:
+                return False, "no such game"
+            if row["status"] != "PUBLISHED":
+                return False, "game not published"
             ver = row["latest"]
             
         with self.lock, self.conn:
@@ -432,12 +448,7 @@ class DB:
 
 db = DB(DB_PATH)
 
-def handle_client(conn, addr):
-    # [State Consistency] 修正：移除 finally 區塊中的自動登出邏輯
-    # 因為 Lobby 使用短連線 (connect -> request -> close)，
-    # 若在此自動登出，使用者會無法保持 Online 狀態。
-    # 現在登出必須依賴 "action": "quit"。
-    
+def handle_client(conn, addr):    
     try:
         while True:
             msg = recv_json(conn)
@@ -506,6 +517,11 @@ def handle_client(conn, addr):
                     send_json(conn, ok(m) if okb else err(m))
                 elif action == "my_downloads":
                     send_json(conn, ok(downloads=db.my_downloads(msg.get("username"))))
+                elif action == "rate_game":
+                    okb, m = db.rate_game(msg.get("username"), msg.get("gamename"), msg.get("score"), msg.get("comment", ""))
+                    send_json(conn, ok(m) if okb else err(m))
+                elif action == "list_ratings":
+                    send_json(conn, ok(ratings=db.list_ratings(msg.get("gamename"))))
                 elif action == "create_room":
                     okb, m = db.create_room(msg.get("room_id"), msg.get("owner"), msg.get("public"))
                     send_json(conn, ok(m) if okb else err(m))

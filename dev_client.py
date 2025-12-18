@@ -7,7 +7,7 @@ from typing import Optional
 # 請確認 utils.py 中已包含 send_file, recv_file
 from utils import send_json, recv_json, gen_req_id, send_file
 
-HOST = os.getenv("DEV_LOBBY_HOST", "localhost")
+HOST = os.getenv("DEV_LOBBY_HOST", "140.113.17.11")
 PORT = int(os.getenv("DEV_LOBBY_PORT", "18950"))
 
 class DevClient:
@@ -144,7 +144,7 @@ class DevClient:
             print("[!] 請先登入。")
             return
 
-        print("\n=== [D1] 上架新遊戲 ===")
+        print("\n=== [D1] 上架新遊戲 (Only .py are allowed)===")
         gamename = input("遊戲名稱 (ID): ").strip()
         filepath = input("遊戲檔案路徑 (例如 ./dist/main.py): ").strip()
 
