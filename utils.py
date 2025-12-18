@@ -5,6 +5,7 @@ from typing import Any, Optional
 import os
 
 MAX_LEN = 65536
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB safety cap
 
 def gen_room_id():
     return "r" + "".join(random.choices(string.digits, k=4))
@@ -99,6 +100,8 @@ def send_file(sock, filepath: str) -> bool:
         return False
 
     filesize = os.path.getsize(filepath)
+    if filesize < 0 or filesize > MAX_FILE_SIZE:
+        return False
     try:
         # 1. 發送檔案大小 (Big-endian, 8 bytes)
         sock.sendall(struct.pack("!Q", filesize))
@@ -127,9 +130,12 @@ def recv_file(sock, dest_path: str) -> bool:
         if not header:
             return False
         (filesize,) = struct.unpack("!Q", header)
+        if filesize < 0 or filesize > MAX_FILE_SIZE:
+            return False
         
         # 2. 接收內容
         received = 0
+        os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
         with open(dest_path, 'wb') as f:
             while received < filesize:
                 # 計算這次要收多少 (剩餘量 vs 緩衝區大小)

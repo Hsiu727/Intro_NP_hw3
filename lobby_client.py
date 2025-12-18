@@ -130,7 +130,10 @@ class LobbyClient:
             
         elif event == "room_status":
             # 更新房間顯示 (如果正在房間畫面的話)
-            pass 
+            r = msg.get("room", {})
+            if r.get("id") == self.current_room_id:
+                # Sync the game name from the server
+                self.current_gamename = r.get("gamename")
             
         elif event == "game_finished":
              self.notification_queue.put(f"--- 遊戲結束 --- Winner: {msg.get('finish',{}).get('winner')}")
@@ -463,7 +466,7 @@ class LobbyClient:
                 # 還是我們應該把 gamename 存在 Client 的 session 裡?
                 # 為了符合 [P3] 邏輯，我們假設開房是為了玩特定遊戲。
                 
-                res = self.call("create_room", public=True)
+                res = self.call("create_room", public=True, gamename=target_game)
                 if res.get("status") == "OK":
                     room_info = res.get("room")
                     self.current_room_id = room_info['id']

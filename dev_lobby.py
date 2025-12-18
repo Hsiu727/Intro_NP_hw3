@@ -36,9 +36,11 @@ def allocate_port_in_range() -> int:
 def db_call(payload: dict):
     try:
         with socket.create_connection((DB_HOST, DB_PORT), timeout=3) as s:
-            send_json(s, {"role": "dev"})
-            send_json(s, payload)
-            return recv_json(s)
+            req = payload.copy()
+            req["role"] = "dev"
+            send_json(s, req)
+            resp = recv_json(s)
+            return resp if isinstance(resp, dict) else err("db protocol error")
     except Exception:
         return err("db unavailable")
 
@@ -91,7 +93,7 @@ def handle_create_game(conn, sess, req):
         send_json(conn, err("not logged in", req_id=req_id))
         return True
     gamename = req.get("gamename")
-    db_resp = db_call({"action": "dev_create_game","gamename": gamename})
+    db_resp = db_call({"action": "dev_create_game", "gamename": gamename, "owner": sess.authed})
     send_json(conn, with_req_id(db_resp, req_id))
     return True
 
@@ -104,6 +106,7 @@ def handle_update_game(conn, sess, req):
     version  = req.get("version")
     db_resp = db_call({
         "action": "dev_update_game",
+        "owner": sess.authed,
         "gamename": gamename,
         "version": version,
     })
@@ -119,6 +122,7 @@ def handle_set_game_status(conn, sess, req):
     status   = req.get("status")
     db_resp = db_call({
         "action": "dev_set_game_status",
+        "owner": sess.authed,
         "gamename": gamename,
         "status": status,
     })
@@ -144,6 +148,14 @@ def handle_upload_game_file(conn, sess, req):
     success = recv_file(conn, save_path)
     
     if success:
+        # 將上傳後的檔案路徑回寫到 DB，供玩家下載/啟動時查詢
+        with contextlib.suppress(Exception):
+            db_call({
+                "action": "dev_update_game_path",
+                "owner": sess.authed,
+                "gamename": gamename,
+                "file_path": save_path,
+            })
         send_json(conn, ok("upload_success", req_id=req_id))
         print(f"File saved to {save_path}")
     else:

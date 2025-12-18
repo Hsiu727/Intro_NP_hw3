@@ -307,13 +307,21 @@ class DB:
         except: return False, "error"
 
     def dev_list_games(self, owner: str):
-        # 修正：回傳 file_path
         with self.lock:
             rows = self.conn.execute(
                 "SELECT id, gamename, status, latest, file_path FROM games WHERE owner=? ORDER BY gamename ASC",
                 (owner,),
             ).fetchall()
-        return [{"id":r["id"], "gamename":r["gamename"], "status":r["status"], "latest":r["latest"], "file_path":r["file_path"]} for r in rows]
+        return [
+            {
+                "id": r["id"],
+                "gamename": r["gamename"],
+                "status": r["status"],
+                "latest": r["latest"],
+                "file_path": r["file_path"],
+            }
+            for r in rows
+        ]
 
     def dev_create_game(self, gamename: str, owner: str, file_path: str = None):
         if not gamename or not owner: return False, "invalid args"
@@ -453,9 +461,18 @@ def handle_client(conn, addr):
                 elif action == "dev_update_game_path":
                     okb, m = db.dev_update_game_path(msg.get("owner"), msg.get("gamename"), msg.get("file_path"))
                     send_json(conn, ok(m) if okb else err(m))
+                elif action == "dev_update_game":
+                    okb, m = db.dev_update_game(msg.get("owner"), msg.get("gamename"), msg.get("version"))
+                    send_json(conn, ok(m) if okb else err(m))
+                elif action == "dev_set_game_status":
+                    okb, m = db.dev_set_game_status(msg.get("owner"), msg.get("gamename"), msg.get("status"))
+                    send_json(conn, ok(m) if okb else err(m))
                 elif action == "dev_list_games":
                     games = db.dev_list_games(msg.get("owner"))
                     send_json(conn, ok(games=games))
+                elif action == "reset_dev_runtime":
+                    reset_dev_runtime(db)
+                    send_json(conn, ok("reset"))
                 elif action == "quit": # Explicit Dev Logout
                     db.dev_logout(msg.get("username"))
                     send_json(conn, ok("bye"))
@@ -497,6 +514,9 @@ def handle_client(conn, addr):
                 elif action == "reset_runtime":
                     reset_runtime(db)
                     send_json(conn, ok("reset"))
+                elif action == "finish_game":
+                    # 目前 lobby 端只需要不噴錯；可依需求把 summary 寫入 DB
+                    send_json(conn, ok("finished"))
                 else:
                     send_json(conn, err("unknown action"))
 

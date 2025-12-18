@@ -95,9 +95,96 @@ class StubGameServer:
             except Exception as e:
                 print(f"[Lobby] on_finish callback error: {e}")
 
+class BroadcastGameServer:
+    """
+    升級版的 GameServer：
+    1. 接受兩位玩家連線
+    2. 收到任一玩家訊息後，廣播給房間內所有人 (除了發送者自己，視邏輯而定)
+    3. 處理 force_stop
+    """
+    def __init__(self, room_id: str, host: str, port: int, on_finish):
+        self.room_id = room_id
+        self.host = host
+        self.port = port
+        self.on_finish = on_finish
+        self._running = threading.Event()
+        self._running.set()
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind((host, port))
+        self._srv.listen(2) # 允許兩人
+        self.clients = []   # 存放 (conn, addr)
+        self.lock = threading.Lock()
+        
+        self._serve_thread = threading.Thread(target=self._accept_loop, daemon=True)
+
+    def start(self):
+        print(f"[GameServer] Room {self.room_id} started on port {self.port}")
+        self._serve_thread.start()
+
+    def stop(self, reason: str = "stopped"):
+        self._running.clear()
+        with contextlib.suppress(Exception):
+            self._srv.close()
+        # 關閉所有連線
+        with self.lock:
+            for conn, _ in self.clients:
+                with contextlib.suppress(Exception):
+                    conn.close()
+            self.clients.clear()
+            
+        if self.on_finish:
+            # 避免重複 callback
+            cb = self.on_finish
+            self.on_finish = None
+            try:
+                cb(self.room_id, {"reason": reason})
+            except Exception as e:
+                print(f"[GameServer] callback error: {e}")
+
+    def _accept_loop(self):
+        while self._running.is_set():
+            try:
+                conn, addr = self._srv.accept()
+                with self.lock:
+                    self.clients.append((conn, addr))
+                threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
+            except OSError:
+                break
+
+    def _handle_client(self, conn, addr):
+        print(f"[GameServer] Player connected: {addr}")
+        try:
+            while self._running.is_set():
+                msg = recv_json(conn)
+                if msg is None: break
+                
+                # 特殊指令: 強制結束
+                if msg.get("type") == "force_stop":
+                    self.stop("forced_stop")
+                    break
+
+                # 廣播訊息給「其他人」 (轉發邏輯)
+                # 這裡簡單做：轉發給列表裡「不是自己」的連線
+                with self.lock:
+                    for c, a in self.clients:
+                        if c != conn:
+                            send_json(c, msg)
+                            
+        except Exception as e:
+            print(f"[GameServer] Client error {addr}: {e}")
+        finally:
+            with self.lock:
+                if (conn, addr) in self.clients:
+                    self.clients.remove((conn, addr))
+            conn.close()
+            # 如果人都走光了，就關閉 Server
+            if not self.clients and self._running.is_set():
+                print("[GameServer] All players left, shutting down.")
+                self.stop("empty_room")
 
 def start_game_server(room_id: str, host: str, port: int, on_finish):
-    server = StubGameServer(room_id, host, port, on_finish)
+    server = BroadcastGameServer(room_id, host, port, on_finish)
     server.start()
     return server
 
@@ -105,9 +192,11 @@ def start_game_server(room_id: str, host: str, port: int, on_finish):
 def db_call(payload: dict):
     try:
         with socket.create_connection((DB_HOST, DB_PORT), timeout=3) as s:
-            send_json(s, {"role": "user"})
-            send_json(s, payload)
-            return recv_json(s)
+            req = payload.copy()
+            req["role"] = "user"
+            send_json(s, req)
+            resp = recv_json(s)
+            return resp if isinstance(resp, dict) else err("db protocol error")
     except Exception:
         return err("db unavailable")
 
@@ -118,6 +207,7 @@ def _room_status_payload(room):
         "room": {
             "id": room.id,
             "owner": room.owner,
+            "gamename": room.gamename,
             "public": bool(room.public),
             "open": bool(room.open),
             "members": list(room.players),
@@ -136,9 +226,10 @@ def _broadcast_room_status(room, exclude_user=None):
 
 
 class Room:
-    def __init__(self, room_id: str, owner: str, public: bool = True):
+    def __init__(self, room_id: str, owner: str, gamename: str, public: bool = True):
         self.id = room_id
         self.owner = owner
+        self.gamename = gamename
         self.public = public
         self.players = [owner]
         self.open = True
@@ -226,14 +317,18 @@ def handle_login(conn, sess, msg):
             return True
 
     db_resp = db_call({"action": "login", "username": username, "password": password})
-    if db_resp and db_resp.get("status") == "OK":
+    if db_resp.get("status") == "OK":
         with LOCK:
             sess.authed = username
             USERS[username] = sess
     send_json(conn, with_req_id(db_resp, req_id))
 
-    db_resp = db_call({"action": "show_status", "username": username})
-    send_json(conn, with_req_id(db_resp, req_id))
+    # show_status 是額外資訊：即使 DB 回應異常也不應讓 lobby 斷線
+    try:
+        status_resp = db_call({"action": "show_status", "username": username})
+        send_json(conn, with_req_id(status_resp, req_id))
+    except Exception:
+        pass
     return True
 
 def handle_who_online(conn, sess, msg):
@@ -248,6 +343,7 @@ def handle_create_room(conn, sess, msg):
         send_json(conn, err("not logged in", req_id=req_id))
         return True
     public = msg.get("public", True)
+    gamename = msg.get("gamename")
     
     with LOCK:
         rid = gen_room_id()
@@ -261,13 +357,14 @@ def handle_create_room(conn, sess, msg):
             send_json(conn, with_req_id(db_resp, req_id))
             return True
 
-        room = Room(rid, sess.authed, public)
+        room = Room(rid, sess.authed, gamename, public)
         ROOMS[rid] = room
         sess.room = rid
     
     send_json(conn, ok("room_created", req_id=req_id, room={
         "id": rid,
         "owner": room.owner,
+        "gamename": room.gamename,
         "public": room.public,
         "players": list(room.players),
         "open": room.open
